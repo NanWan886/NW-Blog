@@ -2,7 +2,7 @@
 # wrangler.toml — NW Navigation 部署配置
 # ============================================================
 name = "nw-blog"
-pages_build_output_dir = "public"
+main = "src/worker.js"
 compatibility_date = "2025-04-01"
 
 # 环境变量（可选）

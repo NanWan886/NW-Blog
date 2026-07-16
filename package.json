@@ -8,7 +8,7 @@
     "deploy": "wrangler deploy",
     "preview": "wrangler dev --local"
   },
-  "keywords": ["cloudflare", "workers", "navigation", "statistics"],
+  "keywords": ["cloudflare", "workers", "navigation"],
   "license": "MIT",
   "devDependencies": {
     "wrangler": "^3.0.0"
