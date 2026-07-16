@@ -1,0 +1,10 @@
+# ============================================================
+# wrangler.toml — NW Navigation 部署配置
+# ============================================================
+name = "nw-blog"
+main = "src/worker.js"
+compatibility_date = "2025-04-01"
+
+# 环境变量（可选）
+[vars]
+ENVIRONMENT = "production"
