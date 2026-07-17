@@ -547,7 +547,7 @@ function renderFrontend(user) {
 + 'h+=\'</tbody></table></div>\';e.innerHTML=h}).catch(function(){e.innerHTML="<p>加载失败</p>"})}\n'
 + 'window.adDelThr=function(id){if(!confirm("确定删除？"))return;api("DELETE","/threads/"+id).then(function(){t("已删除");pgAdThreads()}).catch(function(e){})};\n'
 + 'updNav();doRoute();})();\n</script>\n</body>\n</html>';
-+ }
+}
 
 
 export default {
