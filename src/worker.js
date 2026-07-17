@@ -1,9 +1,9 @@
 // ─── NW Forum · 完整 Worker ───
-function hasDB(e){return !!(e&&e.DB)}
+function hasDB(e){return !!(e&&e.db)}
 
 async function initDB(e){
   if(!hasDB(e)) return;
-  try{await e.DB.exec("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT DEFAULT 'user',created_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,description TEXT DEFAULT '');CREATE TABLE IF NOT EXISTS threads(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,content TEXT NOT NULL,user_id INTEGER NOT NULL,category_id INTEGER DEFAULT 1,pinned INTEGER DEFAULT 0,views INTEGER DEFAULT 0,created_at TEXT DEFAULT (datetime('now')),updated_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT,content TEXT NOT NULL,user_id INTEGER NOT NULL,thread_id INTEGER NOT NULL,created_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,token TEXT UNIQUE NOT NULL,expires_at TEXT NOT NULL);INSERT OR IGNORE INTO categories(id,name,description)VALUES(1,'默认版块','默认讨论版块')")}
+  try{await e.db.exec("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT DEFAULT 'user',created_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,description TEXT DEFAULT '');CREATE TABLE IF NOT EXISTS threads(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,content TEXT NOT NULL,user_id INTEGER NOT NULL,category_id INTEGER DEFAULT 1,pinned INTEGER DEFAULT 0,views INTEGER DEFAULT 0,created_at TEXT DEFAULT (datetime('now')),updated_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT,content TEXT NOT NULL,user_id INTEGER NOT NULL,thread_id INTEGER NOT NULL,created_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,token TEXT UNIQUE NOT NULL,expires_at TEXT NOT NULL);INSERT OR IGNORE INTO categories(id,name,description)VALUES(1,'默认版块','默认讨论版块')")}
   catch(e){console.error(e)}
 }
 
@@ -30,7 +30,7 @@ async function getU(e,r){
   if(!hasDB(e))return null;
   var t=parC(r.headers.get('Cookie')||'')['nw_forum_token'];
   if(!t)return null;
-  try{return await e.DB.prepare("SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON s.user_id=u.id WHERE s.token=? AND s.expires_at>datetime('now')").bind(t).first()||null}
+  try{return await e.db.prepare("SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON s.user_id=u.id WHERE s.token=? AND s.expires_at>datetime('now')").bind(t).first()||null}
   catch(er){return null}
 }
 
@@ -41,9 +41,9 @@ async function apiReg(e,b){
   if(!u||!p||u.length<2||u.length>20||p.length<6)return json({error:'用户名2-20字符，密码至少6字符'},400);
   if(!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(u))return json({error:'用户名只允许字母、数字、下划线和中文'},400);
   try{
-    if(await e.DB.prepare('SELECT id FROM users WHERE username=?').bind(u).first())return json({error:'用户名已存在'},409);
-    var ph=await hashPw(p),c=await e.DB.prepare('SELECT COUNT(*)as c FROM users').first(),r=(c&&c.c===0)?'admin':'user';
-    await e.DB.prepare('INSERT INTO users(username,password_hash,role)VALUES(?,?,?)').bind(u,ph,r).run();
+    if(await e.db.prepare('SELECT id FROM users WHERE username=?').bind(u).first())return json({error:'用户名已存在'},409);
+    var ph=await hashPw(p),c=await e.db.prepare('SELECT COUNT(*)as c FROM users').first(),r=(c&&c.c===0)?'admin':'user';
+    await e.db.prepare('INSERT INTO users(username,password_hash,role)VALUES(?,?,?)').bind(u,ph,r).run();
     return json({message:'注册成功',role:r})
   }catch(er){return json({error:'注册失败'},500)}
 }
@@ -53,11 +53,11 @@ async function apiLog(e,b){
   var u=b.username,p=b.password;
   if(!u||!p)return json({error:'请填写用户名和密码'},400);
   try{
-    var us=await e.DB.prepare('SELECT * FROM users WHERE username=?').bind(u).first();
+    var us=await e.db.prepare('SELECT * FROM users WHERE username=?').bind(u).first();
     if(!us||!(await verPw(p,us.password_hash)))return json({error:'用户名或密码错误'},401);
     var t=genT(),h=new Headers({'Content-Type':'application/json'});
     h.append('Set-Cookie',setC(t));
-    await e.DB.prepare("INSERT INTO sessions(user_id,token,expires_at)VALUES(?,?,datetime('now','+7 days'))").bind(us.id,t).run();
+    await e.db.prepare("INSERT INTO sessions(user_id,token,expires_at)VALUES(?,?,datetime('now','+7 days'))").bind(us.id,t).run();
     return new Response(JSON.stringify({message:'登录成功',username:us.username,role:us.role}),{status:200,headers:h})
   }catch(er){return json({error:'登录失败'},500)}
 }
@@ -65,7 +65,7 @@ async function apiLog(e,b){
 async function apiOut(e,r){
   if(!hasDB(e)){var h=new Headers();h.append('Set-Cookie',clrC());h.append('Content-Type','application/json');return new Response(JSON.stringify({message:'已登出'}),{headers:h})}
   var t=parC(r.headers.get('Cookie')||'')['nw_forum_token'];
-  if(t)try{await e.DB.prepare('DELETE FROM sessions WHERE token=?').bind(t).run()}catch(er){}
+  if(t)try{await e.db.prepare('DELETE FROM sessions WHERE token=?').bind(t).run()}catch(er){}
   var h=new Headers({'Content-Type':'application/json'});h.append('Set-Cookie',clrC());
   return new Response(JSON.stringify({message:'已登出'}),{headers:h})
 }
@@ -76,9 +76,9 @@ async function apiThr(e,r){
   if(!hasDB(e))return json({threads:[],total:0,page:1,totalPages:0});
   var u=new URL(r.url),p=Math.max(1,parseInt(u.searchParams.get('page'))||1),l=20,o=(p-1)*l;
   try{
-    var cnt=await e.DB.prepare('SELECT COUNT(*)as total FROM threads').first();
+    var cnt=await e.db.prepare('SELECT COUNT(*)as total FROM threads').first();
     var t=cnt?cnt.total:0;
-    var rows=await e.DB.prepare('SELECT t.id,t.title,t.user_id,t.pinned,t.views,t.created_at,t.updated_at,u.username,(SELECT COUNT(*)FROM posts WHERE thread_id=t.id)as reply_count,c.name as category_name FROM threads t JOIN users u ON t.user_id=u.id LEFT JOIN categories c ON t.category_id=c.id ORDER BY t.pinned DESC,t.updated_at DESC LIMIT ? OFFSET ?').bind(l,o).all();
+    var rows=await e.db.prepare('SELECT t.id,t.title,t.user_id,t.pinned,t.views,t.created_at,t.updated_at,u.username,(SELECT COUNT(*)FROM posts WHERE thread_id=t.id)as reply_count,c.name as category_name FROM threads t JOIN users u ON t.user_id=u.id LEFT JOIN categories c ON t.category_id=c.id ORDER BY t.pinned DESC,t.updated_at DESC LIMIT ? OFFSET ?').bind(l,o).all();
     return json({threads:rows.results||[],total:t,page:p,totalPages:Math.ceil(t/l)})
   }catch(er){return json({threads:[],total:0,page:1,totalPages:0})}
 }
@@ -86,10 +86,10 @@ async function apiThr(e,r){
 async function apiThrD(e,id){
   if(!hasDB(e))return json({error:'数据库未配置'},503);
   try{
-    var t=await e.DB.prepare('SELECT t.*,u.username,c.name as category_name FROM threads t JOIN users u ON t.user_id=u.id LEFT JOIN categories c ON t.category_id=c.id WHERE t.id=?').bind(id).first();
+    var t=await e.db.prepare('SELECT t.*,u.username,c.name as category_name FROM threads t JOIN users u ON t.user_id=u.id LEFT JOIN categories c ON t.category_id=c.id WHERE t.id=?').bind(id).first();
     if(!t)return json({error:'帖子不存在'},404);
-    await e.DB.prepare('UPDATE threads SET views=views+1 WHERE id=?').bind(id).run();
-    var ps=await e.DB.prepare('SELECT p.*,u.username,u.role FROM posts p JOIN users u ON p.user_id=u.id WHERE p.thread_id=? ORDER BY p.created_at ASC').bind(id).all();
+    await e.db.prepare('UPDATE threads SET views=views+1 WHERE id=?').bind(id).run();
+    var ps=await e.db.prepare('SELECT p.*,u.username,u.role FROM posts p JOIN users u ON p.user_id=u.id WHERE p.thread_id=? ORDER BY p.created_at ASC').bind(id).all();
     return json({thread:t,posts:ps.results||[]})
   }catch(er){return json({error:'查询失败'},500)}
 }
@@ -100,7 +100,7 @@ async function apiCThr(e,r,b){
   if(!b.title||!b.content)return json({error:'标题和内容不能为空'},400);
   if(b.title.length>100)return json({error:'标题不能超过100字符'},400);
   try{
-    var re=await e.DB.prepare('INSERT INTO threads(title,content,user_id)VALUES(?,?,?)').bind(sanit(b.title),sanit(b.content),u.id).run();
+    var re=await e.db.prepare('INSERT INTO threads(title,content,user_id)VALUES(?,?,?)').bind(sanit(b.title),sanit(b.content),u.id).run();
     return json({message:'发帖成功',id:re.meta.last_row_id},201)
   }catch(er){return json({error:'发帖失败'},500)}
 }
@@ -110,9 +110,9 @@ async function apiCPo(e,r,b){
   if(!hasDB(e))return json({error:'数据库未配置'},503);
   if(!b.content)return json({error:'内容不能为空'},400);
   try{
-    if(!await e.DB.prepare('SELECT id FROM threads WHERE id=?').bind(b.thread_id).first())return json({error:'帖子不存在'},404);
-    await e.DB.prepare('INSERT INTO posts(content,user_id,thread_id)VALUES(?,?,?)').bind(sanit(b.content),u.id,b.thread_id).run();
-    await e.DB.prepare("UPDATE threads SET updated_at=datetime('now') WHERE id=?").bind(b.thread_id).run();
+    if(!await e.db.prepare('SELECT id FROM threads WHERE id=?').bind(b.thread_id).first())return json({error:'帖子不存在'},404);
+    await e.db.prepare('INSERT INTO posts(content,user_id,thread_id)VALUES(?,?,?)').bind(sanit(b.content),u.id,b.thread_id).run();
+    await e.db.prepare("UPDATE threads SET updated_at=datetime('now') WHERE id=?").bind(b.thread_id).run();
     return json({message:'回复成功'},201)
   }catch(er){return json({error:'回复失败'},500)}
 }
@@ -121,11 +121,11 @@ async function apiDTh(e,r,id){
   var u=await getU(e,r);if(!u)return json({error:'未登录'},401);
   if(!hasDB(e))return json({error:'数据库未配置'},503);
   try{
-    var t=await e.DB.prepare('SELECT user_id FROM threads WHERE id=?').bind(id).first();
+    var t=await e.db.prepare('SELECT user_id FROM threads WHERE id=?').bind(id).first();
     if(!t)return json({error:'帖子不存在'},404);
     if(u.role!=='admin'&&t.user_id!==u.id)return json({error:'无权操作'},403);
-    await e.DB.prepare('DELETE FROM posts WHERE thread_id=?').bind(id).run();
-    await e.DB.prepare('DELETE FROM threads WHERE id=?').bind(id).run();
+    await e.db.prepare('DELETE FROM posts WHERE thread_id=?').bind(id).run();
+    await e.db.prepare('DELETE FROM threads WHERE id=?').bind(id).run();
     return json({message:'删除成功'})
   }catch(er){return json({error:'删除失败'},500)}
 }
@@ -134,10 +134,10 @@ async function apiDPo(e,r,id){
   var u=await getU(e,r);if(!u)return json({error:'未登录'},401);
   if(!hasDB(e))return json({error:'数据库未配置'},503);
   try{
-    var p=await e.DB.prepare('SELECT user_id FROM posts WHERE id=?').bind(id).first();
+    var p=await e.db.prepare('SELECT user_id FROM posts WHERE id=?').bind(id).first();
     if(!p)return json({error:'回复不存在'},404);
     if(u.role!=='admin'&&p.user_id!==u.id)return json({error:'无权操作'},403);
-    await e.DB.prepare('DELETE FROM posts WHERE id=?').bind(id).run();
+    await e.db.prepare('DELETE FROM posts WHERE id=?').bind(id).run();
     return json({message:'删除成功'})
   }catch(er){return json({error:'删除失败'},500)}
 }
@@ -146,7 +146,7 @@ async function apiAS(e,r){
   var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
   if(!hasDB(e))return json({error:'数据库未配置'},503);
   try{
-    var uc=await e.DB.prepare('SELECT COUNT(*)as c FROM users').first(),tc=await e.DB.prepare('SELECT COUNT(*)as c FROM threads').first(),pc=await e.DB.prepare('SELECT COUNT(*)as c FROM posts').first(),ru=await e.DB.prepare('SELECT id,username,role,created_at FROM users ORDER BY created_at DESC LIMIT 5').all();
+    var uc=await e.db.prepare('SELECT COUNT(*)as c FROM users').first(),tc=await e.db.prepare('SELECT COUNT(*)as c FROM threads').first(),pc=await e.db.prepare('SELECT COUNT(*)as c FROM posts').first(),ru=await e.db.prepare('SELECT id,username,role,created_at FROM users ORDER BY created_at DESC LIMIT 5').all();
     return json({users:uc.c,threads:tc.c,posts:pc.c,recentUsers:ru.results||[]})
   }catch(er){return json({error:'查询失败'},500)}
 }
@@ -154,7 +154,7 @@ async function apiAS(e,r){
 async function apiAU(e,r){
   var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
   if(!hasDB(e))return json({error:'数据库未配置'},503);
-  try{var rows=await e.DB.prepare('SELECT id,username,role,created_at FROM users ORDER BY id').all();return json(rows.results||[])}
+  try{var rows=await e.db.prepare('SELECT id,username,role,created_at FROM users ORDER BY id').all();return json(rows.results||[])}
   catch(er){return json({error:'查询失败'},500)}
 }
 
@@ -162,7 +162,7 @@ async function apiASR(e,r,b){
   var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
   if(!hasDB(e))return json({error:'数据库未配置'},503);
   if(!['user','admin'].includes(b.role))return json({error:'无效角色'},400);
-  try{await e.DB.prepare('UPDATE users SET role=? WHERE id=?').bind(b.role,b.user_id).run();return json({message:'角色已更新'})}
+  try{await e.db.prepare('UPDATE users SET role=? WHERE id=?').bind(b.role,b.user_id).run();return json({message:'角色已更新'})}
   catch(er){return json({error:'更新失败'},500)}
 }
 
@@ -170,7 +170,7 @@ async function apiAD(e,r,id){
   var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
   if(parseInt(id)===u.id)return json({error:'不能删除自己'},400);
   if(!hasDB(e))return json({error:'数据库未配置'},503);
-  try{await e.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(id).run();await e.DB.prepare('DELETE FROM posts WHERE user_id=?').bind(id).run();await e.DB.prepare('DELETE FROM threads WHERE user_id=?').bind(id).run();await e.DB.prepare('DELETE FROM users WHERE id=?').bind(id).run();return json({message:'用户已删除'})}
+  try{await e.db.prepare('DELETE FROM sessions WHERE user_id=?').bind(id).run();await e.db.prepare('DELETE FROM posts WHERE user_id=?').bind(id).run();await e.db.prepare('DELETE FROM threads WHERE user_id=?').bind(id).run();await e.db.prepare('DELETE FROM users WHERE id=?').bind(id).run();return json({message:'用户已删除'})}
   catch(er){return json({error:'删除失败'},500)}
 }
 
