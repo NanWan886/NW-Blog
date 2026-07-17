@@ -1,607 +1,299 @@
-// ============================================================
-// NW Forum  简易论坛系统  (Cloudflare Worker + D1)
-// 前后端一体，管理员面板，安全防护
-// ============================================================
+// ─── NW Forum · 完整 Worker ───
+function hasDB(e){return !!(e&&e.DB)}
 
-// ─── DB 保护 ───
-function checkDB(env) {
-  return !!(env && env.DB);
+async function initDB(e){
+  if(!hasDB(e)) return;
+  try{await e.DB.exec("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT DEFAULT 'user',created_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,description TEXT DEFAULT '');CREATE TABLE IF NOT EXISTS threads(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,content TEXT NOT NULL,user_id INTEGER NOT NULL,category_id INTEGER DEFAULT 1,pinned INTEGER DEFAULT 0,views INTEGER DEFAULT 0,created_at TEXT DEFAULT (datetime('now')),updated_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT,content TEXT NOT NULL,user_id INTEGER NOT NULL,thread_id INTEGER NOT NULL,created_at TEXT DEFAULT (datetime('now')));CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,token TEXT UNIQUE NOT NULL,expires_at TEXT NOT NULL);INSERT OR IGNORE INTO categories(id,name,description)VALUES(1,'默认版块','默认讨论版块')")}
+  catch(e){console.error(e)}
 }
 
-// ─── 初始化数据库 ───
-async function initDatabase(env) {
-  if (!checkDB(env)) return;
-  try {
-    await env.DB.exec(`
-      CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT DEFAULT 'user',
-        created_at TEXT DEFAULT (datetime('now'))
-      );
-      CREATE TABLE IF NOT EXISTS categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL,
-        description TEXT DEFAULT '',
-        created_at TEXT DEFAULT (datetime('now'))
-      );
-      CREATE TABLE IF NOT EXISTS threads (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        user_id INTEGER NOT NULL,
-        category_id INTEGER DEFAULT 1,
-        pinned INTEGER DEFAULT 0,
-        views INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT (datetime('now')),
-        updated_at TEXT DEFAULT (datetime('now'))
-      );
-      CREATE TABLE IF NOT EXISTS posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        content TEXT NOT NULL,
-        user_id INTEGER NOT NULL,
-        thread_id INTEGER NOT NULL,
-        created_at TEXT DEFAULT (datetime('now'))
-      );
-      CREATE TABLE IF NOT EXISTS sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        token TEXT UNIQUE NOT NULL,
-        expires_at TEXT NOT NULL
-      );
-      INSERT OR IGNORE INTO categories (id, name, description) VALUES (1, '默认版块', '默认讨论版块');
-    `);
-  } catch (e) { console.error('DB init:', e); }
+async function hashPw(p){
+  var s=crypto.getRandomValues(new Uint8Array(16)),k=await crypto.subtle.importKey('raw',new TextEncoder().encode(p),'PBKDF2',false,['deriveBits']),
+  b=await crypto.subtle.deriveBits({name:'PBKDF2',salt:s,iterations:1e5,hash:'SHA-256'},k,256),
+  h=btoa(String.fromCharCode(...new Uint8Array(b)));
+  return btoa(String.fromCharCode(...s))+':'+h
+}
+async function verPw(p,st){
+  var a=st.split(':'),s=new Uint8Array([...atob(a[0])].map(function(c){return c.charCodeAt(0)})),
+  k=await crypto.subtle.importKey('raw',new TextEncoder().encode(p),'PBKDF2',false,['deriveBits']),
+  b=await crypto.subtle.deriveBits({name:'PBKDF2',salt:s,iterations:1e5,hash:'SHA-256'},k,256);
+  return btoa(String.fromCharCode(...new Uint8Array(b)))===a[1]
+}
+function genT(){return Array.from(crypto.getRandomValues(new Uint8Array(32)),function(b){return b.toString(16).padStart(2,'0')}).join('')}
+function sanit(s){return typeof s!='string'?'':s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function parC(c){var o={};if(c)c.split(';').forEach(function(x){var p=x.trim().split('=');if(p.length>=2)o[p[0]]=p.slice(1).join('=')});return o}
+function setC(t){return 'nw_forum_token='+t+'; HttpOnly; Secure; Path=/; SameSite=Lax; Expires='+new Date(Date.now()+7*864e5).toUTCString()}
+function clrC(){return 'nw_forum_token=; HttpOnly; Secure; Path=/; SameSite=Lax; Expires=Thu, 01 Jan 1970 00:00:00 GMT'}
+function json(d,s){return new Response(JSON.stringify(d),{status:s||200,headers:{'Content-Type':'application/json; charset=utf-8'}})}
+
+async function getU(e,r){
+  if(!hasDB(e))return null;
+  var t=parC(r.headers.get('Cookie')||'')['nw_forum_token'];
+  if(!t)return null;
+  try{return await e.DB.prepare("SELECT u.id,u.username,u.role FROM sessions s JOIN users u ON s.user_id=u.id WHERE s.token=? AND s.expires_at>datetime('now')").bind(t).first()||null}
+  catch(er){return null}
 }
 
-// ─── 安全函数 ───
-async function hashPassword(password) {
-  const encoder = new TextEncoder();
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256
-  );
-  const h = btoa(String.fromCharCode(...new Uint8Array(bits)));
-  const s = btoa(String.fromCharCode(...salt));
-  return s + ':' + h;
+// API handlers
+async function apiReg(e,b){
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  var u=b.username,p=b.password;
+  if(!u||!p||u.length<2||u.length>20||p.length<6)return json({error:'用户名2-20字符，密码至少6字符'},400);
+  if(!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(u))return json({error:'用户名只允许字母、数字、下划线和中文'},400);
+  try{
+    if(await e.DB.prepare('SELECT id FROM users WHERE username=?').bind(u).first())return json({error:'用户名已存在'},409);
+    var ph=await hashPw(p),c=await e.DB.prepare('SELECT COUNT(*)as c FROM users').first(),r=(c&&c.c===0)?'admin':'user';
+    await e.DB.prepare('INSERT INTO users(username,password_hash,role)VALUES(?,?,?)').bind(u,ph,r).run();
+    return json({message:'注册成功',role:r})
+  }catch(er){return json({error:'注册失败'},500)}
 }
 
-async function verifyPassword(password, stored) {
-  const [s, h] = stored.split(':');
-  const salt = new Uint8Array([...atob(s)].map(c => c.charCodeAt(0)));
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256
-  );
-  return btoa(String.fromCharCode(...new Uint8Array(bits))) === h;
+async function apiLog(e,b){
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  var u=b.username,p=b.password;
+  if(!u||!p)return json({error:'请填写用户名和密码'},400);
+  try{
+    var us=await e.DB.prepare('SELECT * FROM users WHERE username=?').bind(u).first();
+    if(!us||!(await verPw(p,us.password_hash)))return json({error:'用户名或密码错误'},401);
+    var t=genT(),h=new Headers({'Content-Type':'application/json'});
+    h.append('Set-Cookie',setC(t));
+    await e.DB.prepare("INSERT INTO sessions(user_id,token,expires_at)VALUES(?,?,datetime('now','+7 days'))").bind(us.id,t).run();
+    return new Response(JSON.stringify({message:'登录成功',username:us.username,role:us.role}),{status:200,headers:h})
+  }catch(er){return json({error:'登录失败'},500)}
 }
 
-function generateToken() {
-  return Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2,'0')).join('');
+async function apiOut(e,r){
+  if(!hasDB(e)){var h=new Headers();h.append('Set-Cookie',clrC());h.append('Content-Type','application/json');return new Response(JSON.stringify({message:'已登出'}),{headers:h})}
+  var t=parC(r.headers.get('Cookie')||'')['nw_forum_token'];
+  if(t)try{await e.DB.prepare('DELETE FROM sessions WHERE token=?').bind(t).run()}catch(er){}
+  var h=new Headers({'Content-Type':'application/json'});h.append('Set-Cookie',clrC());
+  return new Response(JSON.stringify({message:'已登出'}),{headers:h})
 }
 
-function sanitize(s) {
-  if (typeof s !== 'string') return '';
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+async function apiMe(e,r){var u=await getU(e,r);if(!u)return json({error:'未登录'},401);return json({user:{id:u.id,username:u.username,role:u.role}})}
+
+async function apiThr(e,r){
+  if(!hasDB(e))return json({threads:[],total:0,page:1,totalPages:0});
+  var u=new URL(r.url),p=Math.max(1,parseInt(u.searchParams.get('page'))||1),l=20,o=(p-1)*l;
+  try{
+    var cnt=await e.DB.prepare('SELECT COUNT(*)as total FROM threads').first();
+    var t=cnt?cnt.total:0;
+    var rows=await e.DB.prepare('SELECT t.id,t.title,t.user_id,t.pinned,t.views,t.created_at,t.updated_at,u.username,(SELECT COUNT(*)FROM posts WHERE thread_id=t.id)as reply_count,c.name as category_name FROM threads t JOIN users u ON t.user_id=u.id LEFT JOIN categories c ON t.category_id=c.id ORDER BY t.pinned DESC,t.updated_at DESC LIMIT ? OFFSET ?').bind(l,o).all();
+    return json({threads:rows.results||[],total:t,page:p,totalPages:Math.ceil(t/l)})
+  }catch(er){return json({threads:[],total:0,page:1,totalPages:0})}
 }
 
-function parseCookie(cookieStr) {
-  const o = {};
-  if (!cookieStr) return o;
-  cookieStr.split(';').forEach(c => { const p = c.trim().split('='); if (p.length >= 2) o[p[0]] = p.slice(1).join('='); });
-  return o;
+async function apiThrD(e,id){
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  try{
+    var t=await e.DB.prepare('SELECT t.*,u.username,c.name as category_name FROM threads t JOIN users u ON t.user_id=u.id LEFT JOIN categories c ON t.category_id=c.id WHERE t.id=?').bind(id).first();
+    if(!t)return json({error:'帖子不存在'},404);
+    await e.DB.prepare('UPDATE threads SET views=views+1 WHERE id=?').bind(id).run();
+    var ps=await e.DB.prepare('SELECT p.*,u.username,u.role FROM posts p JOIN users u ON p.user_id=u.id WHERE p.thread_id=? ORDER BY p.created_at ASC').bind(id).all();
+    return json({thread:t,posts:ps.results||[]})
+  }catch(er){return json({error:'查询失败'},500)}
 }
 
-function setCookie(token) {
-  const exp = new Date(Date.now() + 7*86400000).toUTCString();
-  return 'nw_forum_token=' + token + '; HttpOnly; Secure; Path=/; SameSite=Lax; Expires=' + exp;
-}
-function clearCookie() {
-  return 'nw_forum_token=; HttpOnly; Secure; Path=/; SameSite=Lax; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
-}
-
-async function getCurrentUser(env, request) {
-  if (!checkDB(env)) return null;
-  const cookie = parseCookie(request.headers.get('Cookie') || '');
-  const token = cookie['nw_forum_token'];
-  if (!token) return null;
-  try {
-    const row = await env.DB.prepare(
-      "SELECT u.id, u.username, u.role FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token = ? AND s.expires_at > datetime('now')"
-    ).bind(token).first();
-    return row || null;
-  } catch (e) { return null; }
+async function apiCThr(e,r,b){
+  var u=await getU(e,r);if(!u)return json({error:'请先登录'},401);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  if(!b.title||!b.content)return json({error:'标题和内容不能为空'},400);
+  if(b.title.length>100)return json({error:'标题不能超过100字符'},400);
+  try{
+    var re=await e.DB.prepare('INSERT INTO threads(title,content,user_id)VALUES(?,?,?)').bind(sanit(b.title),sanit(b.content),u.id).run();
+    return json({message:'发帖成功',id:re.meta.last_row_id},201)
+  }catch(er){return json({error:'发帖失败'},500)}
 }
 
-// ─── JSON ───
-function json(data, status) {
-  return new Response(JSON.stringify(data), {
-    status: status || 200,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' }
-  });
+async function apiCPo(e,r,b){
+  var u=await getU(e,r);if(!u)return json({error:'请先登录'},401);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  if(!b.content)return json({error:'内容不能为空'},400);
+  try{
+    if(!await e.DB.prepare('SELECT id FROM threads WHERE id=?').bind(b.thread_id).first())return json({error:'帖子不存在'},404);
+    await e.DB.prepare('INSERT INTO posts(content,user_id,thread_id)VALUES(?,?,?)').bind(sanit(b.content),u.id,b.thread_id).run();
+    await e.DB.prepare("UPDATE threads SET updated_at=datetime('now') WHERE id=?").bind(b.thread_id).run();
+    return json({message:'回复成功'},201)
+  }catch(er){return json({error:'回复失败'},500)}
 }
 
-// ─── API 路由 ───
-
-// 注册
-async function apiRegister(env, body) {
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  const { username, password } = body;
-  if (!username || !password || username.length < 2 || username.length > 20 || password.length < 6)
-    return json({ error: '用户名2-20字符，密码至少6字符' }, 400);
-  if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username))
-    return json({ error: '用户名只允许字母、数字、下划线和中文' }, 400);
-  try {
-    const exist = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
-    if (exist) return json({ error: '用户名已存在' }, 409);
-    const ph = await hashPassword(password);
-    const cnt = await env.DB.prepare('SELECT COUNT(*) as c FROM users').first();
-    const role = (cnt && cnt.c === 0) ? 'admin' : 'user';
-    await env.DB.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').bind(username, ph, role).run();
-    return json({ message: '注册成功', role });
-  } catch (e) { return json({ error: '注册失败' }, 500); }
+async function apiDTh(e,r,id){
+  var u=await getU(e,r);if(!u)return json({error:'未登录'},401);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  try{
+    var t=await e.DB.prepare('SELECT user_id FROM threads WHERE id=?').bind(id).first();
+    if(!t)return json({error:'帖子不存在'},404);
+    if(u.role!=='admin'&&t.user_id!==u.id)return json({error:'无权操作'},403);
+    await e.DB.prepare('DELETE FROM posts WHERE thread_id=?').bind(id).run();
+    await e.DB.prepare('DELETE FROM threads WHERE id=?').bind(id).run();
+    return json({message:'删除成功'})
+  }catch(er){return json({error:'删除失败'},500)}
 }
 
-// 登录
-async function apiLogin(env, body) {
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  const { username, password } = body;
-  if (!username || !password) return json({ error: '请填写用户名和密码' }, 400);
-  try {
-    const u = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
-    if (!u) return json({ error: '用户名或密码错误' }, 401);
-    if (!(await verifyPassword(password, u.password_hash))) return json({ error: '用户名或密码错误' }, 401);
-    const token = generateToken();
-    const hdrs = new Headers({ 'Content-Type': 'application/json' });
-    hdrs.append('Set-Cookie', setCookie(token));
-    await env.DB.prepare(
-      "INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, datetime('now', '+7 days'))"
-    ).bind(u.id, token).run();
-    return new Response(JSON.stringify({ message: '登录成功', username: u.username, role: u.role }), { status: 200, headers: hdrs });
-  } catch (e) { return json({ error: '登录失败' }, 500); }
+async function apiDPo(e,r,id){
+  var u=await getU(e,r);if(!u)return json({error:'未登录'},401);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  try{
+    var p=await e.DB.prepare('SELECT user_id FROM posts WHERE id=?').bind(id).first();
+    if(!p)return json({error:'回复不存在'},404);
+    if(u.role!=='admin'&&p.user_id!==u.id)return json({error:'无权操作'},403);
+    await e.DB.prepare('DELETE FROM posts WHERE id=?').bind(id).run();
+    return json({message:'删除成功'})
+  }catch(er){return json({error:'删除失败'},500)}
 }
 
-// 登出
-async function apiLogout(env, request) {
-  if (!checkDB(env)) return json({ message: '已登出' });
-  const cookie = parseCookie(request.headers.get('Cookie') || '');
-  const token = cookie['nw_forum_token'];
-  if (token) try { await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run(); } catch (e) {}
-  const hdrs = new Headers({ 'Content-Type': 'application/json' });
-  hdrs.append('Set-Cookie', clearCookie());
-  return new Response(JSON.stringify({ message: '已登出' }), { status: 200, headers: hdrs });
+async function apiAS(e,r){
+  var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  try{
+    var uc=await e.DB.prepare('SELECT COUNT(*)as c FROM users').first(),tc=await e.DB.prepare('SELECT COUNT(*)as c FROM threads').first(),pc=await e.DB.prepare('SELECT COUNT(*)as c FROM posts').first(),ru=await e.DB.prepare('SELECT id,username,role,created_at FROM users ORDER BY created_at DESC LIMIT 5').all();
+    return json({users:uc.c,threads:tc.c,posts:pc.c,recentUsers:ru.results||[]})
+  }catch(er){return json({error:'查询失败'},500)}
 }
 
-// 当前用户
-async function apiMe(env, request) {
-  const u = await getCurrentUser(env, request);
-  if (!u) return json({ error: '未登录' }, 401);
-  return json({ user: { id: u.id, username: u.username, role: u.role } });
+async function apiAU(e,r){
+  var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  try{var rows=await e.DB.prepare('SELECT id,username,role,created_at FROM users ORDER BY id').all();return json(rows.results||[])}
+  catch(er){return json({error:'查询失败'},500)}
 }
 
-// 分类
-async function apiCategories(env) {
-  if (!checkDB(env)) return json([]);
-  const r = await env.DB.prepare('SELECT * FROM categories ORDER BY id').all();
-  return json(r.results || []);
+async function apiASR(e,r,b){
+  var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  if(!['user','admin'].includes(b.role))return json({error:'无效角色'},400);
+  try{await e.DB.prepare('UPDATE users SET role=? WHERE id=?').bind(b.role,b.user_id).run();return json({message:'角色已更新'})}
+  catch(er){return json({error:'更新失败'},500)}
 }
 
-// 帖子列表
-async function apiThreads(env, request) {
-  if (!checkDB(env)) return json({ threads: [], total: 0, page: 1, totalPages: 0 });
-  const url = new URL(request.url);
-  const page = Math.max(1, parseInt(url.searchParams.get('page')) || 1);
-  const limit = 20;
-  const offset = (page - 1) * limit;
-  try {
-    const cnt = await env.DB.prepare('SELECT COUNT(*) as total FROM threads').first();
-    const total = cnt ? cnt.total : 0;
-    const rows = await env.DB.prepare(`
-      SELECT t.id, t.title, t.user_id, t.pinned, t.views, t.created_at, t.updated_at,
-             u.username, (SELECT COUNT(*) FROM posts WHERE thread_id = t.id) as reply_count,
-             c.name as category_name
-      FROM threads t JOIN users u ON t.user_id = u.id LEFT JOIN categories c ON t.category_id = c.id
-      ORDER BY t.pinned DESC, t.updated_at DESC LIMIT ? OFFSET ?
-    `).bind(limit, offset).all();
-    return json({ threads: rows.results || [], total, page, totalPages: Math.ceil(total / limit) });
-  } catch (e) { return json({ threads: [], total: 0, page: 1, totalPages: 0 }); }
+async function apiAD(e,r,id){
+  var u=await getU(e,r);if(!u||u.role!=='admin')return json({error:'无权访问'},403);
+  if(parseInt(id)===u.id)return json({error:'不能删除自己'},400);
+  if(!hasDB(e))return json({error:'数据库未配置'},503);
+  try{await e.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(id).run();await e.DB.prepare('DELETE FROM posts WHERE user_id=?').bind(id).run();await e.DB.prepare('DELETE FROM threads WHERE user_id=?').bind(id).run();await e.DB.prepare('DELETE FROM users WHERE id=?').bind(id).run();return json({message:'用户已删除'})}
+  catch(er){return json({error:'删除失败'},500)}
 }
 
-// 帖子详情
-async function apiThreadDetail(env, id) {
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  try {
-    const t = await env.DB.prepare(`
-      SELECT t.*, u.username, c.name as category_name FROM threads t JOIN users u ON t.user_id = u.id LEFT JOIN categories c ON t.category_id = c.id WHERE t.id = ?
-    `).bind(id).first();
-    if (!t) return json({ error: '帖子不存在' }, 404);
-    await env.DB.prepare('UPDATE threads SET views = views + 1 WHERE id = ?').bind(id).run();
-    const posts = await env.DB.prepare(
-      'SELECT p.*, u.username, u.role FROM posts p JOIN users u ON p.user_id = u.id WHERE p.thread_id = ? ORDER BY p.created_at ASC'
-    ).bind(id).all();
-    return json({ thread: t, posts: posts.results || [] });
-  } catch (e) { return json({ error: '查询失败' }, 500); }
+// ─── 前端 ───
+function htmlPage(user) {
+  var uj = JSON.stringify(user ? {id:user.id, username:user.username, role:user.role} : null);
+  return '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1.0">\n<title>NW Forum</title>\n<style>\n'
++'body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f7fa;color:#1a1a2e;line-height:1.6}\n'
++'.nav{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:0 1px 3px rgba(0,0,0,.08)}\n'
++'.nav a{color:#6366f1;text-decoration:none;padding:8px 16px;border-radius:8px;transition:.2s;font-size:.875rem}\n'
++'.nav a:hover{background:#f0f2f5}\n'
++'.nav .lg{font-size:1.2rem;font-weight:700;background:linear-gradient(135deg,#6366f1,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}\n'
++'.nav-r{display:flex;align-items:center;gap:8px}\n'
++'.con{max-width:960px;margin:0 auto;padding:24px 16px}\n'
++'.card{background:#fff;border-radius:12px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb;margin-bottom:12px}\n'
++'.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border:none;border-radius:8px;font-size:.875rem;cursor:pointer;transition:.2s;font-family:inherit;background:#f0f2f5;color:#1a1a2e}\n'
++'.btn:hover{transform:translateY(-1px);box-shadow:0 8px 32px rgba(0,0,0,.1)}\n'
++'.btn-p{background:#6366f1;color:#fff}.btn-p:hover{background:#4f46e5}\n'
++'.btn-d{background:#ef4444;color:#fff}.btn-d:hover{background:#dc2626}\n'
++'.btn-sm{padding:6px 12px;font-size:.8rem}\n'
++'.inp{width:100%;padding:10px 14px;border:2px solid #e5e7eb;border-radius:8px;font-size:.9rem;transition:.2s;outline:none;font-family:inherit;box-sizing:border-box}\n'
++'.inp:focus,.ta:focus{border-color:#6366f1;box-shadow:0 0 0 3px #eef2ff}\n'
++'.ta{width:100%;padding:10px 14px;border:2px solid #e5e7eb;border-radius:8px;font-size:.9rem;transition:.2s;outline:none;font-family:inherit;min-height:120px;resize:vertical;box-sizing:border-box}\n'
++'.fg{margin-bottom:16px}.fg label{display:block;font-size:.875rem;font-weight:500;margin-bottom:6px;color:#6b7280}\n'
++'.ti{font-size:1.05rem;font-weight:600;color:#1a1a2e;cursor:pointer}\n'
++'.ti:hover{color:#6366f1}\n'
++'.mt{font-size:.8rem;color:#6b7280;display:flex;gap:16px;flex-wrap:wrap;margin-top:4px}\n'
++'.pg{animation:fade .3s ease}@keyframes fade{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}\n'
++'.ld{text-align:center;padding:40px;color:#6b7280}\n'
++'.sp{width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:#6366f1;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}\n'
++'.ep{text-align:center;padding:60px 20px;color:#6b7280}@keyframes spin{to{transform:rotate(360deg)}}\n'
++'.badge{background:#ef4444;color:#fff;padding:2px 8px;border-radius:99px;font-size:.7rem;font-weight:600;margin-left:6px}\n'
++'.pj{border-left:3px solid #6366f1;background:#f0f2f5;border-radius:0 8px 8px 0;padding:16px;margin-bottom:12px}\n'
++'.pj .ph{display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:8px}\n'
++'.pc{white-space:pre-wrap;word-break:break-word;font-size:.9rem}\n'
++'.th{font-size:1.5rem;margin-bottom:8px}.thc{white-space:pre-wrap;word-break:break-word;font-size:.95rem}\n'
++'.not{text-align:center;padding:60px 20px;color:#6b7280}\n'
++'.ts{position:fixed;top:80px;right:20px;z-index:300;display:flex;flex-direction:column;gap:8px}\n'
++'.to{background:#fff;padding:12px 20px;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,.1);font-size:.875rem;border-left:4px solid #6366f1;max-width:320px;animation:sl .3s ease}\n'
++'.to.e{border-left-color:#ef4444}.to.s{border-left-color:#22c55e}@keyframes sl{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}\n'
++'.pg2{display:flex;justify-content:center;gap:8px;margin-top:24px}\n'
++'.pg2 button{padding:8px 14px;border:1px solid #e5e7eb;background:#fff;border-radius:8px;cursor:pointer;font-family:inherit;font-size:.85rem}\n'
++'.pg2 button:hover{background:#f0f2f5}.pg2 button.a{background:#6366f1;color:#fff;border-color:#6366f1}\n'
++'.pg2 button:disabled{opacity:.4;cursor:not-allowed}.thr{border-bottom:1px solid #e5e7eb;padding:16px 0;cursor:pointer;display:flex;gap:16px}.thr:last-child{border-bottom:none}\n'
++'.thr:hover{padding-left:8px}.ti2{flex:1;min-width:0}.ts2{text-align:right;flex-shrink:0;color:#6b7280;font-size:.85rem}\n'
++'.st{display:grid;gap:12px;margin-bottom:24px}.st .c{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px;text-align:center}.st .n{font-size:2rem;font-weight:700;color:#6366f1}.st .l{font-size:.85rem;color:#6b7280;margin-top:4px}\n'
++'.ab{display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap}.ab button{padding:10px 20px;border:2px solid #e5e7eb;background:#fff;border-radius:8px;cursor:pointer;font-family:inherit;font-size:.85rem;color:#6b7280;font-weight:500}\n'
++'.ab button:hover{border-color:#6366f1}.ab button.a{background:#6366f1;color:#fff;border-color:#6366f1}\n'
++'.tbl{width:100%;border-collapse:collapse;font-size:.85rem}.tbl th{text-align:left;padding:12px 8px;border-bottom:2px solid #e5e7eb;color:#6b7280;font-weight:600}.tbl td{padding:10px 8px;border-bottom:1px solid #e5e7eb}.tbl tr:hover td{background:#f0f2f5}\n'
++'.au{max-width:420px;margin:60px auto}.at{display:flex;margin-bottom:24px;background:#f0f2f5;border-radius:8px;overflow:hidden}.at button{flex:1;padding:12px;border:none;background:transparent;font-size:.9rem;cursor:pointer;color:#6b7280;font-family:inherit}.at button.a{background:#6366f1;color:#fff}\n'
++'.af{display:none}.af.a{display:block}@media(max-width:640px){.nav{padding:0 12px}.con{padding:16px 12px}.au{margin:30px auto}.ts2{display:none}}\n'
++'</style>\n</head>\n<body>\n'
++'<nav class="nav"><a href="/" class="lg">NW Forum</a><div class="nav-r">'
++'<span id="nu" style="display:none"><span id="navA" style="display:inline-flex;width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#a855f7);color:#fff;align-items:center;justify-content:center;font-weight:600;font-size:.8rem;margin-right:6px">U</span><span id="navU"></span><span class="badge" id="navB" style="display:none">管理员</span></span>'
++'<a href="/" onclick="return nav(event,\'/\')">首页</a><a href="/new" onclick="return nav(event,\'/new\')" id="nNew" style="display:none">发帖</a><a href="/admin" onclick="return nav(event,\'/admin\')" id="nAdm" style="display:none">管理</a><a href="/login" onclick="return nav(event,\'/login\')" id="nLog">登录</a>'
++'<button id="nOut" style="display:none" class="btn btn-sm" onclick="lgout()">登出</button>'
++'</div></nav>\n'
++'<div class="ts" id="tss"></div>\n'
++'<main class="con" id="app"><div class="ld"><div class="sp"></div><p>加载中...</p></div></main>\n'
++'<script>\n(function(){\n'
++'var CU='+uj+';\n'
++'var cp=1,ap="dashboard";\n'
++'function esc(s){var d=document.createElement("div");d.textContent=s||"";return d.innerHTML}\n'
++'function to(msg,ty){var c=document.getElementById("tss"),d=document.createElement("div");d.className="to "+(ty==="error"?"e":"s");d.textContent=msg;c.appendChild(d);setTimeout(function(){d.remove()},3e3)}\n'
++'function api(m,p,b){var o={method:m,headers:{}};if(b){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(b)}return fetch("/api"+p,o).then(function(r){return r.json().then(function(d){if(!r.ok&&d.error)throw new Error(d.error);return d})})}\n'
++'function nv(e,p){e&&e.preventDefault();history.pushState(null,"",p);rt()}\n'
++'window.addEventListener("popstate",rt);\n'
++'function nav(e,p){return nv(e,p),false}\n'
++'function upd(){var lo=document.getElementById("nLog"),lo2=document.getElementById("nOut"),nu=document.getElementById("nu"),nn=document.getElementById("nNew"),na=document.getElementById("nAdm");if(CU){lo.style.display="none";lo2.style.display="";nu.style.display="";document.getElementById("navA").textContent=CU.username.charAt(0).toUpperCase();document.getElementById("navU").textContent=CU.username;document.getElementById("navB").style.display=CU.role==="admin"?"":"none";nn.style.display="";na.style.display=CU.role==="admin"?"":"none"}else{lo.style.display="";lo2.style.display="none";nu.style.display="none";nn.style.display="none";na.style.display="none"}}\n'
++'function lgout(){api("POST","/auth/logout").then(function(){CU=null;upd();nv(null,"/")}).catch(function(e){})}\n'
++'function ago(d){var dt=new Date(d+"Z"),s=Math.floor((new Date()-dt)/1e3);if(s<60)return"刚刚";var m=Math.floor(s/60);if(m<60)return m+"分钟前";var h=Math.floor(m/60);if(h<24)return h+"小时前";var dy=Math.floor(h/24);if(dy<30)return dy+"天前";return(d||"").split(" ")[0]}\n'
++'function rt(){var p=window.location.pathname;if(p==="/login")pgL();else if(p==="/new")pgN();else if(p==="/admin")pgA();else if(p.indexOf("/thread/")===0)pgT(p.split("/")[2]);else pgH()}\n'
++'function pgH(){var a=document.getElementById("app");a.innerHTML=\'<div class="pg"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px"><h2> 全部帖子</h2>\'+(CU?\'<button class="btn btn-p" onclick="return nv(event,\'/new\')">+ 发新帖</button>\':"")+\'</div><div class="ld"><div class="sp"></div><p>加载中...</p></div></div>\';api("GET","/threads?page="+cp).then(function(d){var h=\'<div class="pg"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px"><h2> 全部帖子</h2>\'+(CU?\'<button class="btn btn-p" onclick="return nv(event,\'/new\')">+ 发新帖</button>\':"")+\'</div>\';if(!d.threads||d.threads.length===0){h+=\'<div class="not"><p>还没有帖子</p></div>\'}else{d.threads.forEach(function(t){h+=\'<div class="card thr" onclick="nv(event,\'/thread/\'+t.id+\')\'"><div class="ti2"><div class="ti">\'+esc(t.title)+\'</div><div class="mt"><span>\'+esc(t.username)+\'</span><span>\'+ (t.category_name||"默认")+\'</span><span>\'+ago(t.created_at)+\'</span></div></div><div class="ts2"><div> &#x1f4ac;\'+(t.reply_count||0)+\'</div><div> &#x1f441;\'+t.views+\'</div></div></div>\'});if(d.totalPages>1){h+=\'<div class="pg2">\';h+=\'<button onclick="cp=\'+(cp-1)+\';pgH()" \'+(cp<=1?"disabled":"")+\'>上一页</button>\';for(var i=1;i<=d.totalPages;i++)h+=\'<button onclick="cp=\'+i+\';pgH()" class="\'+(i===cp?"a":"")+\'">\'+i+\'</button>\';h+=\'<button onclick="cp=\'+(cp+1)+\';pgH()" \'+(cp>=d.totalPages?"disabled":"")+\'>下一页</button></div>\'}}a.innerHTML=h}).catch(function(e){a.innerHTML=\'<div class="pg"><div class="card not"><p>数据库未配置，请在 Cloudflare Dashboard 绑定 D1 数据库</p></div></div>\'})}\n'
++'function pgT(id){var a=document.getElementById("app");a.innerHTML=\'<div class="pg"><div class="ld"><div class="sp"></div><p>加载中...</p></div></div>\';api("GET","/threads/"+id).then(function(d){var t=d.thread,ps=d.posts||[];var h=\'<div class="pg"><a href="/" onclick="return nv(event,\'/\')" style="margin-bottom:12px;display:inline-block"> 返回首页</a>\';h+=\'<div class="card"><div class="th">\'+esc(t.title)+\'</div><div class="mt" style="margin-bottom:12px"><span>\'+esc(t.username)+\'</span><span>\'+t.created_at+\'</span><span> &#x1f441;\'+t.views+\'次浏览</span></div><div class="thc">\'+esc(t.content)+\'</div>\';if(CU&&(CU.role==="admin"||CU.id===t.user_id))h+=\'<div style="margin-top:12px"><button class="btn btn-d btn-sm" onclick="delThr(\'+t.id+\')"> 删除</button></div>\';h+=\'</div><h3 style="margin:20px 0 12px"> 回复 (\'+ps.length+\')</h3>\';if(ps.length===0)h+=\'<p style="color:#6b7280;margin-bottom:16px">暂无回复</p>\';ps.forEach(function(p){h+=\'<div class="pj"><div class="ph"><span style="font-weight:600">\'+esc(p.username)+(p.role==="admin"?\' <span class="badge">管理员</span>\':"")+\'</span><span style="color:#6b7280;font-size:.8rem">\'+ago(p.created_at)+\'</span></div><div class="pc">\'+esc(p.content)+\'</div>\';if(CU&&(CU.role==="admin"||CU.id===p.user_id))h+=\'<div style="margin-top:8px"><button class="btn btn-d btn-sm" onclick="delPo(\'+p.id+\')"> 删除</button></div>\';h+=\'</div>\'});if(CU){h+=\'<div class="card"><h4 style="margin-bottom:12px">发表回复</h4><textarea class="ta" id="rp" placeholder="回复内容..." style="margin-bottom:12px"></textarea><button class="btn btn-p" onclick="rep(\'+id+\')">发表回复</button></div>\'}h+=\'</div>\';a.innerHTML=h}).catch(function(e){a.innerHTML=\'<div class="pg"><p>加载失败</p></div>\'})}\n'
++'function rep(id){var c=document.getElementById("rp").value;if(!c.trim())return to("请输入内容","error");api("POST","/posts",{content:c,thread_id:parseInt(id)}).then(function(){to("回复成功");pgT(id)}).catch(function(e){})}\n'
++'function delThr(id){if(!confirm("确定删除？"))return;api("DELETE","/threads/"+id).then(function(){to("已删除");nv(null,"/")}).catch(function(e){})}\n'
++'function delPo(id){if(!confirm("确定删除？"))return;api("DELETE","/posts/"+id).then(function(){to("已删除");rt()}).catch(function(e){})}\n'
++'function pgN(){if(!CU){to("请先登录","error");nv(null,"/login");return}var a=document.getElementById("app");a.innerHTML=\'<div class="pg"><h2 style="margin-bottom:20px"> 发布新帖</h2><div class="card"><div class="fg"><label>标题</label><input class="inp" id="tT" placeholder="帖子标题" maxlength="100"></div><div class="fg"><label>内容</label><textarea class="ta" id="tC" placeholder="写下内容..." style="min-height:180px"></textarea></div><button class="btn btn-p" onclick="nThr()">发布帖子</button></div></div>\'}\n'
++'function nThr(){var ti=document.getElementById("tT").value,co=document.getElementById("tC").value;if(!ti.trim())return to("请输入标题","error");if(!co.trim())return to("请输入内容","error");api("POST","/threads",{title:ti,content:co}).then(function(){to("发帖成功");nv(null,"/")}).catch(function(e){})}\n'
++'function pgL(){var a=document.getElementById("app");a.innerHTML=\'<div class="pg au"><h2 style="text-align:center;margin-bottom:8px"> 欢迎回来</h2><p style="text-align:center;color:#6b7280;margin-bottom:24px">登录或注册</p><div class="at"><button class="a" onclick="swA(\'l\')">登录</button><button onclick="swA(\'r\')">注册</button></div><div class="af a" id="lf"><div class="fg"><label>用户名</label><input class="inp" id="lU"></div><div class="fg"><label>密码</label><input class="inp" type="password" id="lP"></div><button class="btn btn-p" style="width:100%;justify-content:center" onclick="doL()">登录</button></div><div class="af" id="rf"><div class="fg"><label>用户名</label><input class="inp" id="rU" placeholder="2-20个字符"></div><div class="fg"><label>密码</label><input class="inp" type="password" id="rP" placeholder="至少6个字符"></div><button class="btn btn-p" style="width:100%;justify-content:center" onclick="doR()">注册</button></div></div>\'}\n'
++'function swA(t){document.querySelectorAll(".af").forEach(function(f){f.classList.remove("a")});document.querySelectorAll(".at button").forEach(function(b){b.classList.remove("a")});if(t==="l"){document.getElementById("lf").classList.add("a");document.querySelector(".at button:first-child").classList.add("a")}else{document.getElementById("rf").classList.add("a");document.querySelector(".at button:last-child").classList.add("a")}}\n'
++'function doL(){var u=document.getElementById("lU").value,p=document.getElementById("lP").value;api("POST","/auth/login",{username:u,password:p}).then(function(d){CU={id:d.id||0,username:d.username,role:d.role};upd();to("登录成功");nv(null,"/")}).catch(function(e){})}\n'
++'function doR(){var u=document.getElementById("rU").value,p=document.getElementById("rP").value;api("POST","/auth/register",{username:u,password:p}).then(function(){to("注册成功，请登录");swA("l")}).catch(function(e){})}\n'
++'function pgA(){if(!CU||CU.role!=="admin"){to("无权访问","error");nv(null,"/");return}var a=document.getElementById("app");a.innerHTML=\'<div class="pg"><h2> 管理面板</h2><p style="color:#6b7280;margin-bottom:20px">论坛管理</p><div class="ab"><button class="a" onclick="swAd(\'d\')"> 概览</button><button onclick="swAd(\'u\')"> 用户</button><button onclick="swAd(\'t\')"> 帖子</button></div><div id="adC"><div class="ld"><div class="sp"></div><p>加载中...</p></div></div></div>\';pgAdD()}\n'
++'function swAd(t){ap=t;document.querySelectorAll(".ab button").forEach(function(b){b.classList.remove("a")});document.querySelectorAll(".ab button").forEach(function(b){if((t==="d"&&b.textContent.indexOf("概览")!==-1)||(t==="u"&&b.textContent.indexOf("用户")!==-1)||(t==="t"&&b.textContent.indexOf("帖子")!==-1))b.classList.add("a")});if(t==="d")pgAdD();else if(t==="u")pgAdU();else if(t==="t")pgAdT()}\n'
++'function pgAdD(){var e=document.getElementById("adC");e.innerHTML=\'<div class="ld"><div class="sp"></div><p>加载中...</p></div>\';api("GET","/admin/stats").then(function(s){var h=\'<div class="st" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr))"><div class="c"><div class="n">\'+s.users+\'</div><div class="l">用户数</div></div><div class="c"><div class="n">\'+s.threads+\'</div><div class="l">帖子数</div></div><div class="c"><div class="n">\'+s.posts+\'</div><div class="l">回复数</div></div></div><div class="card"><h4 style="margin-bottom:12px">最近注册</h4>\';if(s.recentUsers&&s.recentUsers.length>0){h+=\'<table class="tbl"><thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>时间</th></tr></thead><tbody>\';s.recentUsers.forEach(function(u){h+=\'<tr><td>\'+u.id+\'</td><td>\'+esc(u.username)+\'</td><td>\'+(u.role==="admin"?\'<span class="badge">管理员</span>\':"用户")+\'</td><td>\'+u.created_at+\'</td></tr>\'});h+=\'</tbody></table>\'}h+=\'</div>\';e.innerHTML=h}).catch(function(){e.innerHTML="<p>加载失败</p>"})}\n'
++'function pgAdU(){var e=document.getElementById("adC");e.innerHTML=\'<div class="ld"><div class="sp"></div><p>加载中...</p></div>\';api("GET","/admin/users").then(function(us){var h=\'<div class="card"><h4 style="margin-bottom:12px"> 用户管理</h4><table class="tbl"><thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>时间</th><th>操作</th></tr></thead><tbody>\';us.forEach(function(u){h+=\'<tr><td>\'+u.id+\'</td><td>\'+esc(u.username)+\'</td><td>\'+(u.role==="admin"?\'<span class="badge">管理员</span>\':"用户")+\'</td><td>\'+u.created_at+\'</td><td>\';if(u.id!==CU.id){h+=\'<button class="btn btn-sm" onclick="setR(\'+u.id+\',\\\'admin\\\')\'">设管理员</button> <button class="btn btn-d btn-sm" onclick="delU(\'+u.id+\')"> 删除</button>\'}else{h+=\'<span style="color:#6b7280">当前用户</span>\'}h+=\'</td></tr>\'});h+=\'</tbody></table></div>\';e.innerHTML=h}).catch(function(){e.innerHTML="<p>加载失败</p>"})}\n'
++'function setR(uid,role){api("POST","/admin/set-role",{user_id:uid,role:role}).then(function(){to("角色已更新");pgAdU()}).catch(function(e){})}\n'
++'function delU(uid){if(!confirm("确定删除？"))return;api("DELETE","/admin/users/"+uid).then(function(){to("用户已删除");pgAdU()}).catch(function(e){})}\n'
++'function pgAdT(){var e=document.getElementById("adC");e.innerHTML=\'<div class="ld"><div class="sp"></div><p>加载中...</p></div>\';api("GET","/threads?page=1").then(function(d){var h=\'<div class="card"><h4 style="margin-bottom:12px"> 帖子管理</h4><table class="tbl"><thead><tr><th>ID</th><th>标题</th><th>作者</th><th>回复</th><th>时间</th><th>操作</th></tr></thead><tbody>\';d.threads.forEach(function(t){h+=\'<tr><td>\'+t.id+\'</td><td>\'+esc(t.title).substring(0,30)+\'</td><td>\'+esc(t.username)+\'</td><td>\'+(t.reply_count||0)+\'</td><td>\'+ago(t.created_at)+\'</td><td><button class="btn btn-d btn-sm" onclick="adDTh(\'+t.id+\')"> 删除</button></td></tr>\'});h+=\'</tbody></table></div>\';e.innerHTML=h}).catch(function(){e.innerHTML="<p>加载失败</p>"})}\n'
++'function adDTh(id){if(!confirm("确定删除？"))return;api("DELETE","/threads/"+id).then(function(){to("已删除");pgAdT()}).catch(function(e){})}\n'
++'upd();rt();})();\n</script>\n</body>\n</html>';
 }
 
-// 创建帖子
-async function apiCreateThread(env, request, body) {
-  const u = await getCurrentUser(env, request);
-  if (!u) return json({ error: '请先登录' }, 401);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  const { title, content } = body;
-  if (!title || !content) return json({ error: '标题和内容不能为空' }, 400);
-  if (title.length > 100) return json({ error: '标题不能超过100字符' }, 400);
-  try {
-    const r = await env.DB.prepare(
-      'INSERT INTO threads (title, content, user_id) VALUES (?, ?, ?)'
-    ).bind(sanitize(title), sanitize(content), u.id).run();
-    return json({ message: '发帖成功', id: r.meta.last_row_id }, 201);
-  } catch (e) { return json({ error: '发帖失败' }, 500); }
-}
-
-// 创建回复
-async function apiCreatePost(env, request, body) {
-  const u = await getCurrentUser(env, request);
-  if (!u) return json({ error: '请先登录' }, 401);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  const { content, thread_id } = body;
-  if (!content) return json({ error: '内容不能为空' }, 400);
-  try {
-    const t = await env.DB.prepare('SELECT id FROM threads WHERE id = ?').bind(thread_id).first();
-    if (!t) return json({ error: '帖子不存在' }, 404);
-    await env.DB.prepare('INSERT INTO posts (content, user_id, thread_id) VALUES (?, ?, ?)').bind(sanitize(content), u.id, thread_id).run();
-    await env.DB.prepare("UPDATE threads SET updated_at = datetime('now') WHERE id = ?").bind(thread_id).run();
-    return json({ message: '回复成功' }, 201);
-  } catch (e) { return json({ error: '回复失败' }, 500); }
-}
-
-// 删除帖子
-async function apiDeleteThread(env, request, id) {
-  const u = await getCurrentUser(env, request);
-  if (!u) return json({ error: '未登录' }, 401);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  try {
-    const t = await env.DB.prepare('SELECT user_id FROM threads WHERE id = ?').bind(id).first();
-    if (!t) return json({ error: '帖子不存在' }, 404);
-    if (u.role !== 'admin' && t.user_id !== u.id) return json({ error: '无权操作' }, 403);
-    await env.DB.prepare('DELETE FROM posts WHERE thread_id = ?').bind(id).run();
-    await env.DB.prepare('DELETE FROM threads WHERE id = ?').bind(id).run();
-    return json({ message: '删除成功' });
-  } catch (e) { return json({ error: '删除失败' }, 500); }
-}
-
-// 删除回复
-async function apiDeletePost(env, request, id) {
-  const u = await getCurrentUser(env, request);
-  if (!u) return json({ error: '未登录' }, 401);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  try {
-    const p = await env.DB.prepare('SELECT user_id FROM posts WHERE id = ?').bind(id).first();
-    if (!p) return json({ error: '回复不存在' }, 404);
-    if (u.role !== 'admin' && p.user_id !== u.id) return json({ error: '无权操作' }, 403);
-    await env.DB.prepare('DELETE FROM posts WHERE id = ?').bind(id).run();
-    return json({ message: '删除成功' });
-  } catch (e) { return json({ error: '删除失败' }, 500); }
-}
-
-// 管理员统计
-async function apiAdminStats(env, request) {
-  const u = await getCurrentUser(env, request);
-  if (!u || u.role !== 'admin') return json({ error: '无权访问' }, 403);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  try {
-    const uc = await env.DB.prepare('SELECT COUNT(*) as c FROM users').first();
-    const tc = await env.DB.prepare('SELECT COUNT(*) as c FROM threads').first();
-    const pc = await env.DB.prepare('SELECT COUNT(*) as c FROM posts').first();
-    const ru = await env.DB.prepare('SELECT id, username, role, created_at FROM users ORDER BY created_at DESC LIMIT 5').all();
-    return json({ users: uc.c, threads: tc.c, posts: pc.c, recentUsers: ru.results || [] });
-  } catch (e) { return json({ error: '查询失败' }, 500); }
-}
-
-// 管理员用户列表
-async function apiAdminUsers(env, request) {
-  const u = await getCurrentUser(env, request);
-  if (!u || u.role !== 'admin') return json({ error: '无权访问' }, 403);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  try {
-    const rows = await env.DB.prepare('SELECT id, username, role, created_at FROM users ORDER BY id').all();
-    return json(rows.results || []);
-  } catch (e) { return json({ error: '查询失败' }, 500); }
-}
-
-// 管理员设角色
-async function apiAdminSetRole(env, request, body) {
-  const u = await getCurrentUser(env, request);
-  if (!u || u.role !== 'admin') return json({ error: '无权访问' }, 403);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  const { user_id, role } = body;
-  if (!['user', 'admin'].includes(role)) return json({ error: '无效角色' }, 400);
-  try {
-    await env.DB.prepare('UPDATE users SET role = ? WHERE id = ?').bind(role, user_id).run();
-    return json({ message: '角色已更新' });
-  } catch (e) { return json({ error: '更新失败' }, 500); }
-}
-
-// 管理员删除用户
-async function apiAdminDeleteUser(env, request, id) {
-  const u = await getCurrentUser(env, request);
-  if (!u || u.role !== 'admin') return json({ error: '无权访问' }, 403);
-  if (parseInt(id) === u.id) return json({ error: '不能删除自己' }, 400);
-  if (!checkDB(env)) return json({ error: '数据库未配置' }, 503);
-  try {
-    await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(id).run();
-    await env.DB.prepare('DELETE FROM posts WHERE user_id = ?').bind(id).run();
-    await env.DB.prepare('DELETE FROM threads WHERE user_id = ?').bind(id).run();
-    await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
-    return json({ message: '用户已删除' });
-  } catch (e) { return json({ error: '删除失败' }, 500); }
-}
-
-// ─── 前端 HTML ───
-
-function renderFrontend(user) {
-  var userJSON = user ? JSON.stringify({ id: user.id, username: user.username, role: user.role }) : 'null';
-  return '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>NW Forum</title>\n<style>\n'
-+ '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}\n'
-+ ':root{--bg:#f5f7fa;--s:#fff;--s2:#f0f2f5;--t:#1a1a2e;--t2:#6b7280;--p:#6366f1;--ph:#4f46e5;--pl:#eef2ff;--d:#ef4444;--dh:#dc2626;--g:#22c55e;--b:#e5e7eb;--sh:0 1px 3px rgba(0,0,0,.08);--shl:0 8px 32px rgba(0,0,0,.1);--r:12px;--rs:8px;--tr:.3s cubic-bezier(.4,0,.2,1)}\n'
-+ 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--t);line-height:1.6;min-height:100vh}\n'
-+ 'a{color:var(--p);text-decoration:none;transition:color var(--tr)}a:hover{color:var(--ph)}\n'
-+ '.navbar{background:var(--s);border-bottom:1px solid var(--b);padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:var(--sh);backdrop-filter:blur(12px);background:rgba(255,255,255,.92)}\n'
-+ '.navbar .logo{font-size:1.2rem;font-weight:700;background:linear-gradient(135deg,var(--p),#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}\n'
-+ '.nav-links{display:flex;align-items:center;gap:12px}\n'
-+ '.nav-links a,.nav-links button{padding:8px 16px;border-radius:var(--rs);transition:all var(--tr);font-size:.875rem;cursor:pointer;border:none;background:none;color:var(--t2);font-family:inherit}\n'
-+ '.nav-links a:hover,.nav-links button:hover{background:var(--s2);color:var(--t)}\n'
-+ '.nav-links .btn-p{background:var(--p);color:#fff}.nav-links .btn-p:hover{background:var(--ph);color:#fff}\n'
-+ '.nav-user{display:flex;align-items:center;gap:8px;font-size:.875rem}\n'
-+ '.nav-avatar{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--p),#a855f7);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:.8rem}\n'
-+ '.badge{background:var(--d);color:#fff;padding:2px 8px;border-radius:99px;font-size:.7rem;font-weight:600}\n'
-+ '.container{max-width:960px;margin:0 auto;padding:24px 16px}\n'
-+ '@keyframes pageIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}\n'
-+ '.page{animation:pageIn .35s cubic-bezier(.4,0,.2,1)}\n'
-+ '.card{background:var(--s);border-radius:var(--r);padding:20px;box-shadow:var(--sh);transition:all var(--tr);border:1px solid var(--b)}\n'
-+ '.card:hover{box-shadow:var(--shl)}.card+.card{margin-top:12px}\n'
-+ '.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border:none;border-radius:var(--rs);font-size:.875rem;font-weight:500;cursor:pointer;transition:all var(--tr);font-family:inherit;background:var(--s2);color:var(--t);white-space:nowrap}\n'
-+ '.btn:hover{transform:translateY(-1px);box-shadow:var(--shl)}\n'
-+ '.btn:active{transform:translateY(0)}\n'
-+ '.btn-p{background:var(--p);color:#fff}.btn-p:hover{background:var(--ph)}\n'
-+ '.btn-d{background:var(--d);color:#fff}.btn-d:hover{background:var(--dh)}\n'
-+ '.btn-sm{padding:6px 12px;font-size:.8rem}\n'
-+ '.form-group{margin-bottom:16px}.form-group label{display:block;font-size:.875rem;font-weight:500;margin-bottom:6px;color:var(--t2)}\n'
-+ '.form-input,.form-textarea{width:100%;padding:10px 14px;border:2px solid var(--b);border-radius:var(--rs);font-size:.9rem;transition:all var(--tr);background:var(--s);color:var(--t);font-family:inherit;outline:none}\n'
-+ '.form-input:focus,.form-textarea:focus{border-color:var(--p);box-shadow:0 0 0 3px var(--pl)}\n'
-+ '.form-textarea{min-height:120px;resize:vertical}\n'
-+ '.auth-wrap{max-width:420px;margin:60px auto}.auth-tabs{display:flex;gap:0;margin-bottom:24px;background:var(--s2);border-radius:var(--rs);overflow:hidden}\n'
-+ '.auth-tabs button{flex:1;padding:12px;border:none;background:transparent;font-size:.9rem;font-weight:500;cursor:pointer;transition:all var(--tr);color:var(--t2);font-family:inherit}\n'
-+ '.auth-tabs button.active{background:var(--p);color:#fff}\n'
-+ '.auth-form{display:none;animation:pageIn .3s ease}.auth-form.active{display:block}\n'
-+ '.thread-item{display:flex;gap:16px;padding:16px 0;border-bottom:1px solid var(--b);transition:all var(--tr);cursor:pointer}\n'
-+ '.thread-item:last-child{border-bottom:none}.thread-item:hover{padding-left:8px}\n'
-+ '.thread-info{flex:1;min-width:0}.thread-title{font-size:1.05rem;font-weight:600;margin-bottom:4px;color:var(--t)}\n'
-+ '.thread-meta{font-size:.8rem;color:var(--t2);display:flex;gap:16px;flex-wrap:wrap}\n'
-+ '.thread-stats{text-align:right;flex-shrink:0;font-size:.85rem;color:var(--t2)}\n'
-+ '.pin-badge{display:inline-block;background:var(--pl);color:var(--p);padding:2px 8px;border-radius:99px;font-size:.7rem;font-weight:600;margin-left:8px}\n'
-+ '.thread-header{margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--b)}\n'
-+ '.thread-header h1{font-size:1.5rem;margin-bottom:8px}\n'
-+ '.thread-content{font-size:.95rem;line-height:1.8;white-space:pre-wrap;word-break:break-word}\n'
-+ '.post-item{padding:16px;border-left:3px solid var(--p);background:var(--s2);border-radius:0 var(--rs) var(--rs) 0;margin-bottom:12px;animation:pageIn .3s ease}\n'
-+ '.post-item:nth-child(2){animation-delay:50ms}.post-item:nth-child(3){animation-delay:100ms}\n'
-+ '.post-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:.85rem}\n'
-+ '.post-author{font-weight:600;display:flex;align-items:center;gap:8px}.post-content{white-space:pre-wrap;word-break:break-word;font-size:.9rem}\n'
-+ '.pagination{display:flex;justify-content:center;gap:8px;margin-top:24px}\n'
-+ '.pagination button{padding:8px 14px;border:1px solid var(--b);background:var(--s);border-radius:var(--rs);cursor:pointer;transition:all var(--tr);font-family:inherit;font-size:.85rem}\n'
-+ '.pagination button:hover{background:var(--s2)}.pagination button.active{background:var(--p);color:#fff;border-color:var(--p)}\n'
-+ '.pagination button:disabled{opacity:.4;cursor:not-allowed}\n'
-+ '.admin-bar{display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap}\n'
-+ '.admin-bar button{padding:10px 20px;border:2px solid var(--b);background:var(--s);border-radius:var(--rs);cursor:pointer;font-size:.85rem;font-weight:500;transition:all var(--tr);font-family:inherit;color:var(--t2)}\n'
-+ '.admin-bar button:hover{border-color:var(--p)}.admin-bar button.active{background:var(--p);color:#fff;border-color:var(--p)}\n'
-+ '.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}\n'
-+ '.stat{background:var(--s);border:1px solid var(--b);border-radius:var(--r);padding:20px;text-align:center;transition:all var(--tr)}\n'
-+ '.stat:hover{transform:translateY(-2px);box-shadow:var(--shl)}\n'
-+ '.stat-num{font-size:2rem;font-weight:700;color:var(--p)}.stat-label{font-size:.85rem;color:var(--t2);margin-top:4px}\n'
-+ '.tbl{width:100%;border-collapse:collapse;font-size:.85rem}.tbl th{text-align:left;padding:12px 8px;border-bottom:2px solid var(--b);color:var(--t2);font-weight:600}\n'
-+ '.tbl td{padding:10px 8px;border-bottom:1px solid var(--b)}.tbl tr:hover td{background:var(--s2)}\n'
-+ '.loading{text-align:center;padding:40px;color:var(--t2)}\n'
-+ '.spinner{width:32px;height:32px;border:3px solid var(--b);border-top-color:var(--p);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}\n'
-+ '@keyframes spin{to{transform:rotate(360deg)}}\n'
-+ '.toast-wrap{position:fixed;top:80px;right:20px;z-index:300;display:flex;flex-direction:column;gap:8px}\n'
-+ '.toast{padding:12px 20px;border-radius:var(--rs);background:var(--s);box-shadow:var(--shl);font-size:.875rem;animation:slR .3s ease,fo .3s ease 2.7s forwards;border-left:4px solid var(--p);max-width:320px}\n'
-+ '.toast.err{border-left-color:var(--d)}.toast.ok{border-left-color:var(--g)}\n'
-+ '@keyframes slR{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}\n'
-+ '@keyframes fo{to{opacity:0;transform:translateX(40px)}}\n'
-+ '.empty{text-align:center;padding:60px 20px;color:var(--t2)}.empty .icon{font-size:3rem;margin-bottom:12px}\n'
-+ '@media(max-width:640px){.navbar{padding:0 12px}.container{padding:16px 12px}.auth-wrap{margin:30px auto}.thread-stats{display:none}}\n'
-+ '</style>\n</head>\n<body>\n'
-+ '<nav class="navbar"><a href="/" class="logo" onclick="nv(event,\'/\')">NW Forum</a>'
-+ '<div class="nav-links">'
-+ '<span id="navUser" style="display:none" class="nav-user">'
-+ '<span class="nav-avatar" id="navAvatar">U</span>'
-+ '<span id="navUsername"></span>'
-+ '<span class="badge" id="navBadge" style="display:none">管理员</span></span>'
-+ '<a href="/" onclick="nv(event,\'/\')">首页</a>'
-+ '<a href="/new" onclick="nv(event,\'/new\')" id="navNew" style="display:none">发帖</a>'
-+ '<a href="/admin" onclick="nv(event,\'/admin\')" id="navAdmin" style="display:none">管理</a>'
-+ '<a href="/login" onclick="nv(event,\'/login\')" id="navLogin">登录</a>'
-+ '<button id="navLogout" style="display:none" onclick="doLogout()">登出</button>'
-+ '</div></nav>\n'
-+ '<div class="toast-wrap" id="toasts"></div>\n'
-+ '<main class="container" id="app"></main>\n'
-+ '<script>\n(function(){\n'
-+ 'var CU=' + userJSON + ';\n'
-+ 'var cp=1;\n'
-+ 'function nv(e,p){e&&e.preventDefault();history.pushState(null,"",p);doRoute()}\n'
-+ 'window.addEventListener("popstate",doRoute);\n'
-+ 'function t(msg,ty){var c=document.getElementById("toasts");var d=document.createElement("div");d.className="toast "+(ty==="error"?"err":"ok");d.textContent=msg;c.appendChild(d);setTimeout(function(){d.remove()},3000)}\n'
-+ 'function api(m,pth,bd){var opts={method:m,headers:{}};if(bd){opts.headers["Content-Type"]="application/json";opts.body=JSON.stringify(bd)}'
-+ 'return fetch("/api"+pth,opts).then(function(r){return r.json().then(function(d){if(!r.ok&&d.error)throw new Error(d.error);return d})})}\n'
-+ 'function updNav(){'
-+ 'var lo=document.getElementById("navLogin");var lout=document.getElementById("navLogout");'
-+ 'var nu=document.getElementById("navUser");var na=document.getElementById("navAvatar");'
-+ 'var nun=document.getElementById("navUsername");var nb=document.getElementById("navBadge");'
-+ 'var nn=document.getElementById("navNew");var nad=document.getElementById("navAdmin");'
-+ 'if(CU){lo.style.display="none";lout.style.display="";nu.style.display="";'
-+ 'na.textContent=CU.username.charAt(0).toUpperCase();nun.textContent=CU.username;'
-+ 'nb.style.display=CU.role==="admin"?"":"none";nn.style.display="";nad.style.display=CU.role==="admin"?"":"none"}'
-+ 'else{lo.style.display="";lout.style.display="none";nu.style.display="none";nn.style.display="none";nad.style.display="none"}}\n'
-+ 'function doLogout(){api("POST","/auth/logout").then(function(){CU=null;updNav();nv(null,"/")}).catch(function(e){})}\n'
-+ 'function esc(s){var d=document.createElement("div");d.textContent=s||"";return d.innerHTML}\n'
-+ 'function tago(d){var dt=new Date(d+"Z");var s=Math.floor((new Date()-dt)/1000);'
-+ 'if(s<60)return "刚刚";var m=Math.floor(s/60);if(m<60)return m+"分钟前";var h=Math.floor(m/60);if(h<24)return h+"小时前";'
-+ 'var dy=Math.floor(h/24);if(dy<30)return dy+"天前";return (d||"").split(" ")[0]}\n'
-+ 'function ld(){return \'<div class="loading"><div class="spinner"></div><p>加载中...</p></div>\'}\n'
-+ 'function doRoute(){var p=window.location.pathname;if(p==="/login")pgLogin();else if(p==="/new")pgNew();else if(p==="/admin")pgAdmin();else if(p.indexOf("/thread/")===0)pgThread(p.split("/")[2]);else pgHome()}\n'
-+ 'function pgHome(){var a=document.getElementById("app");a.innerHTML=\'<div class="page"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:12px"><h2> 全部帖子</h2>\'+(CU?\'<button class="btn btn-p" onclick="nv(event,\'/new\')">+ 发新帖</button>\':"")+"</div>"+ld()+"</div>";'
-+ 'api("GET","/threads?page="+cp).then(function(d){'
-+ 'var h=\'<div class="page"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:12px"><h2> 全部帖子</h2>\'+(CU?\'<button class="btn btn-p" onclick="nv(event,\'/new\')">+ 发新帖</button>\':"")+"</div>";'
-+ 'if(!d.threads||d.threads.length===0){h+=\'<div class="card empty"><div class="icon"> </div><p>还没有帖子，来发布第一条吧</p></div>\'}'
-+ 'else{d.threads.forEach(function(t){h+=\'<div class="card thread-item" onclick="nv(event,\'/thread/\'+t.id+\')\'">\';'
-+ 'h+=\'<div class="thread-info">\';if(t.pinned===1)h+=\'<span class="pin-badge">置顶</span>\';'
-+ 'h+=\'<div class="thread-title">\'+esc(t.title)+\'</div>\';'
-+ 'h+=\'<div class="thread-meta"><span> \'+esc(t.username)+\'</span><span> \'+(t.category_name||"默认")+\'</span><span> \'+tago(t.created_at)+\'</span></div></div>\';'
-+ 'h+=\'<div class="thread-stats"><div> \'+(t.reply_count||0)+\'</div><div> \'+t.views+\'</div></div></div>\'});'
-+ 'if(d.totalPages>1){h+=\'<div class="pagination">\';'
-+ 'h+=\'<button onclick="changePg(\'+(cp-1)+\')\" \'+(cp<=1?"disabled":"")+\'>上一页</button>\';'
-+ 'for(var i=1;i<=d.totalPages;i++)h+=\'<button onclick="changePg(\'+i+\')\" class="\'+(i===cp?"active":"")+\'">\'+i+\'</button>\';'
-+ 'h+=\'<button onclick="changePg(\'+(cp+1)+\')\" \'+(cp>=d.totalPages?"disabled":"")+\'>下一页</button></div>\'}}'
-+ 'h+=\'</div>\';a.innerHTML=h}).catch(function(){a.innerHTML=\'<div class="page"><h2> 全部帖子</h2><div class="card empty"><div class="icon"> </div><p>数据库未配置，请先在 Cloudflare Dashboard 绑定 D1 数据库</p></div></div>\'})}\n'
-+ 'window.changePg=function(p){cp=p;pgHome()};\n'
-+ 'function pgThread(id){var a=document.getElementById("app");a.innerHTML=\'<div class="page">\'+ld()+\'</div>\';'
-+ 'api("GET","/threads/"+id).then(function(d){var t=d.thread,ps=d.posts||[];'
-+ 'var h=\'<div class="page"><a href="/" onclick="nv(event,\'/\')" style="margin-bottom:16px;display:inline-block"> 返回首页</a>\';'
-+ 'h+=\'<div class="card"><div class="thread-header">\';if(t.pinned===1)h+=\'<span class="pin-badge">置顶</span>\';'
-+ 'h+=\'<h1>\'+esc(t.title)+\'</h1><div class="thread-meta"><span> \'+esc(t.username)+\'</span><span> \'+(t.category_name||"默认")+\'</span><span> \'+t.created_at+\'</span><span> \'+t.views+\' 次浏览</span></div></div>\';'
-+ 'h+=\'<div class="thread-content">\'+esc(t.content)+\'</div>\';'
-+ 'if(CU&&(CU.role==="admin"||CU.id===t.user_id))h+=\'<div style="margin-top:16px"><button class="btn btn-d btn-sm" onclick="delThr(\'+t.id+\')"> 删除</button></div>\';'
-+ 'h+=\'</div><h3 style="margin:20px 0 12px"> 回复 (\'+ps.length+\')</h3>\';'
-+ 'if(ps.length===0)h+=\'<p style="color:var(--t2);margin-bottom:16px">暂无回复</p>\';'
-+ 'ps.forEach(function(p){h+=\'<div class="post-item"><div class="post-header"><span class="post-author">\'+esc(p.username);'
-+ 'if(p.role==="admin")h+=\' <span class="badge">管理员</span>\';'
-+ 'h+=\'</span><span style="font-size:.8rem;color:var(--t2)">\'+tago(p.created_at)+\'</span></div>\';'
-+ 'h+=\'<div class="post-content">\'+esc(p.content)+\'</div>\';'
-+ 'if(CU&&(CU.role==="admin"||CU.id===p.user_id))h+=\'<div style="margin-top:8px"><button class="btn btn-d btn-sm" onclick="delPost(\'+p.id+\')"> 删除</button></div>\';'
-+ 'h+=\'</div>\'});'
-+ 'if(CU){h+=\'<div class="card" style="margin-top:20px"><h4 style="margin-bottom:12px">发表回复</h4><textarea class="form-textarea" id="rpCont" placeholder="写下你的回复..." style="margin-bottom:12px"></textarea><button class="btn btn-p" onclick="doReply(\'+id+\')">发表回复</button></div>\'}'
-+ 'h+=\'</div>\';a.innerHTML=h}).catch(function(){a.innerHTML=\'<div class="page"><p>加载失败</p></div>\'})}\n'
-+ 'window.doReply=function(tid){var c=document.getElementById("rpCont").value;if(!c.trim())return t("请输入内容","error");'
-+ 'api("POST","/posts",{content:c,thread_id:parseInt(tid)}).then(function(){t("回复成功");pgThread(tid)}).catch(function(e){})};\n'
-+ 'window.delThr=function(id){if(!confirm("确定删除？"))return;api("DELETE","/threads/"+id).then(function(){t("已删除");nv(null,"/")}).catch(function(e){})};\n'
-+ 'window.delPost=function(id){if(!confirm("确定删除？"))return;api("DELETE","/posts/"+id).then(function(){t("已删除");doRoute()}).catch(function(e){})};\n'
-+ 'function pgNew(){if(!CU){t("请先登录","error");nv(null,"/login");return}'
-+ 'var a=document.getElementById("app");a.innerHTML=\'<div class="page"><h2 style="margin-bottom:20px"> 发布新帖</h2><div class="card">'
-+ '<div class="form-group"><label>标题</label><input class="form-input" id="thrTitle" placeholder="帖子标题" maxlength="100"></div>'
-+ '<div class="form-group"><label>内容</label><textarea class="form-textarea" id="thrCont" placeholder="写下内容..." style="min-height:180px"></textarea></div>'
-+ '<button class="btn btn-p" onclick="doNewThread()">发布帖子</button></div></div>\'}\n'
-+ 'window.doNewThread=function(){var ti=document.getElementById("thrTitle").value;var co=document.getElementById("thrCont").value;'
-+ 'if(!ti.trim())return t("请输入标题","error");if(!co.trim())return t("请输入内容","error");'
-+ 'api("POST","/threads",{title:ti,content:co}).then(function(){t("发帖成功");nv(null,"/")}).catch(function(e){})};\n'
-+ 'function pgLogin(){var a=document.getElementById("app");a.innerHTML=\'<div class="page auth-wrap">'
-+ '<h2 style="text-align:center;margin-bottom:8px"> 欢迎回来</h2><p style="text-align:center;color:var(--t2);margin-bottom:24px">登录或注册账号</p>'
-+ '<div class="auth-tabs"><button class="active" onclick="swATab(\'login\')">登录</button><button onclick="swATab(\'register\')">注册</button></div>'
-+ '<div class="auth-form active" id="loginForm"><div class="form-group"><label>用户名</label><input class="form-input" id="lgUser" placeholder="输入用户名"></div>'
-+ '<div class="form-group"><label>密码</label><input class="form-input" type="password" id="lgPass" placeholder="输入密码"></div>'
-+ '<button class="btn btn-p" style="width:100%;justify-content:center" onclick="doLogin()">登录</button></div>'
-+ '<div class="auth-form" id="registerForm"><div class="form-group"><label>用户名</label><input class="form-input" id="rgUser" placeholder="2-20个字符"></div>'
-+ '<div class="form-group"><label>密码</label><input class="form-input" type="password" id="rgPass" placeholder="至少6个字符"></div>'
-+ '<button class="btn btn-p" style="width:100%;justify-content:center" onclick="doRegister()">注册</button></div></div>\'}\n'
-+ 'window.swATab=function(tb){var fs=document.querySelectorAll(".auth-form");var bs=document.querySelectorAll(".auth-tabs button");'
-+ 'fs.forEach(function(f){f.classList.remove("active")});bs.forEach(function(b){b.classList.remove("active")});'
-+ 'if(tb==="login"){document.getElementById("loginForm").classList.add("active");document.querySelector(".auth-tabs button:first-child").classList.add("active")}'
-+ 'else{document.getElementById("registerForm").classList.add("active");document.querySelector(".auth-tabs button:last-child").classList.add("active")}};\n'
-+ 'window.doLogin=function(){var u=document.getElementById("lgUser").value;var p=document.getElementById("lgPass").value;'
-+ 'api("POST","/auth/login",{username:u,password:p}).then(function(d){CU={id:d.id||0,username:d.username,role:d.role};updNav();t("登录成功");nv(null,"/")}).catch(function(e){})};\n'
-+ 'window.doRegister=function(){var u=document.getElementById("rgUser").value;var p=document.getElementById("rgPass").value;'
-+ 'api("POST","/auth/register",{username:u,password:p}).then(function(){t("注册成功，请登录");swATab("login")}).catch(function(e){})};\n'
-+ 'var adTab="dashboard";\n'
-+ 'function pgAdmin(){if(!CU||CU.role!=="admin"){t("无权访问","error");nv(null,"/");return}'
-+ 'var a=document.getElementById("app");a.innerHTML=\'<div class="page"><h2 style="margin-bottom:8px"> 管理面板</h2><p style="color:var(--t2);margin-bottom:20px">论坛管理控制台</p>'
-+ '<div class="admin-bar"><button class="active" onclick="swAdTab(\'dashboard\')"> 概览</button><button onclick="swAdTab(\'users\')"> 用户</button><button onclick="swAdTab(\'threads\')"> 帖子</button></div>'
-+ '<div id="adContent">\'+ld()+\'</div></div>\';pgAdDash()}\n'
-+ 'window.swAdTab=function(tb){adTab=tb;var bs=document.querySelectorAll(".admin-bar button");bs.forEach(function(b){b.classList.remove("active")});'
-+ 'bs.forEach(function(b){if((tb==="dashboard"&&b.textContent.indexOf("概览")!==-1)||(tb==="users"&&b.textContent.indexOf("用户")!==-1)||(tb==="threads"&&b.textContent.indexOf("帖子")!==-1))b.classList.add("active")});'
-+ 'if(tb==="dashboard")pgAdDash();else if(tb==="users")pgAdUsers();else if(tb==="threads")pgAdThreads()};\n'
-+ 'function pgAdDash(){var e=document.getElementById("adContent");e.innerHTML=ld();'
-+ 'api("GET","/admin/stats").then(function(s){'
-+ 'var h=\'<div class="stats"><div class="stat"><div class="stat-num">\'+s.users+\'</div><div class="stat-label">用户数</div></div>'
-+ '<div class="stat"><div class="stat-num">\'+s.threads+\'</div><div class="stat-label">帖子数</div></div>'
-+ '<div class="stat"><div class="stat-num">\'+s.posts+\'</div><div class="stat-label">回复数</div></div></div>\';'
-+ '<div class="card"><h4 style="margin-bottom:12px">最近注册</h4>\';'
-+ 'if(s.recentUsers&&s.recentUsers.length>0){h+=\'<table class="tbl"><thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>注册时间</th></tr></thead><tbody>\';'
-+ 's.recentUsers.forEach(function(u){h+=\'<tr><td>\'+u.id+\'</td><td>\'+esc(u.username)+\'</td><td>\'+(u.role==="admin"?\'<span class="badge">管理员</span>\':"用户")+\'</td><td>\'+u.created_at+\'</td></tr>\'});'
-+ 'h+=\'</tbody></table>\'}h+=\'</div>\';e.innerHTML=h}).catch(function(){e.innerHTML="<p>加载失败</p>"})}\n'
-+ 'function pgAdUsers(){var e=document.getElementById("adContent");e.innerHTML=ld();'
-+ 'api("GET","/admin/users").then(function(us){'
-+ 'var h=\'<div class="card"><h4 style="margin-bottom:12px"> 用户管理</h4><table class="tbl"><thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>注册时间</th><th>操作</th></tr></thead><tbody>\';'
-+ 'us.forEach(function(u){h+=\'<tr><td>\'+u.id+\'</td><td>\'+esc(u.username)+\'</td><td>\'+(u.role==="admin"?\'<span class="badge">管理员</span>\':"用户")+\'</td><td>\'+u.created_at+\'</td><td>\';'
-+ 'if(u.id!==CU.id){if(u.role!=="admin")h+=\'<button class="btn btn-sm" onclick="adSetRole(\'+u.id+\',\\\'admin\\\')\'">设管理员</button> \';'
-+ 'else h+=\'<button class="btn btn-sm" onclick="adSetRole(\'+u.id+\',\\\'user\\\')\'">设为用户</button> \';'
-+ 'h+=\'<button class="btn btn-d btn-sm" onclick="adDelUser(\'+u.id+\')">删除</button>\'}else{h+=\'<span style="color:var(--t2)">当前用户</span>\'}h+=\'</td></tr>\'});'
-+ 'h+=\'</tbody></table></div>\';e.innerHTML=h}).catch(function(){e.innerHTML="<p>加载失败</p>"})}\n'
-+ 'window.adSetRole=function(uid,role){api("POST","/admin/set-role",{user_id:uid,role:role}).then(function(){t("角色已更新");pgAdUsers()}).catch(function(e){})};\n'
-+ 'window.adDelUser=function(uid){if(!confirm("确定删除？"))return;api("DELETE","/admin/users/"+uid).then(function(){t("用户已删除");pgAdUsers()}).catch(function(e){})};\n'
-+ 'function pgAdThreads(){var e=document.getElementById("adContent");e.innerHTML=ld();'
-+ 'api("GET","/threads?page=1").then(function(d){'
-+ 'var h=\'<div class="card"><h4 style="margin-bottom:12px"> 帖子管理</h4><table class="tbl"><thead><tr><th>ID</th><th>标题</th><th>作者</th><th>回复</th><th>时间</th><th>操作</th></tr></thead><tbody>\';'
-+ 'd.threads.forEach(function(t){h+=\'<tr><td>\'+t.id+\'</td><td>\'+esc(t.title).substring(0,30)+\'</td><td>\'+esc(t.username)+\'</td><td>\'+(t.reply_count||0)+\'</td><td>\'+tago(t.created_at)+\'</td><td>\';'
-+ 'h+=\'<button class="btn btn-d btn-sm" onclick="adDelThr(\'+t.id+\')">删除</button></td></tr>\'});'
-+ 'h+=\'</tbody></table></div>\';e.innerHTML=h}).catch(function(){e.innerHTML="<p>加载失败</p>"})}\n'
-+ 'window.adDelThr=function(id){if(!confirm("确定删除？"))return;api("DELETE","/threads/"+id).then(function(){t("已删除");pgAdThreads()}).catch(function(e){})};\n'
-+ 'updNav();doRoute();})();\n</script>\n</body>\n</html>';
-}
-
-
+// ─── 主入口 ───
 export default {
   async fetch(request, env, ctx) {
-    // 初始化数据库（无 D1 时静默跳过）
-    try { await initDatabase(env); } catch (e) {}
+    try { await initDB(env); } catch (e) {}
+    var url = new URL(request.url), path = url.pathname;
 
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // API 路由
     if (path.startsWith('/api/')) {
-      const p = path.replace('/api', '');
-      const m = request.method;
-      let body = {};
-      if (['POST','PUT','DELETE'].includes(m)) {
-        try { body = await request.json(); } catch (e) {}
-      }
+      var p = path.replace('/api', ''), m = request.method, body = {};
+      if (['POST','PUT','DELETE'].includes(m)) try { body = await request.json(); } catch (e) {}
 
-      // 需要鉴权的写操作先验 DB
-      // Auth
-      if (p === '/auth/register' && m === 'POST') return apiRegister(env, body);
-      if (p === '/auth/login' && m === 'POST') return apiLogin(env, body);
-      if (p === '/auth/logout' && m === 'POST') return apiLogout(env, request);
+      if (p === '/auth/register' && m === 'POST') return apiReg(env, body);
+      if (p === '/auth/login' && m === 'POST') return apiLog(env, body);
+      if (p === '/auth/logout' && m === 'POST') return apiOut(env, request);
       if (p === '/me' && m === 'GET') return apiMe(env, request);
-      // Categories
-      if (p === '/categories' && m === 'GET') return apiCategories(env);
-      // Threads
-      if (p === '/threads' && m === 'GET') return apiThreads(env, request);
-      if (p.match(/^\/threads\/\d+$/) && m === 'GET') { const id = p.split('/')[2]; return apiThreadDetail(env, id); }
-      if (p === '/threads' && m === 'POST') return apiCreateThread(env, request, body);
-      if (p.match(/^\/threads\/\d+$/) && m === 'DELETE') { const id = p.split('/')[2]; return apiDeleteThread(env, request, id); }
-      // Posts
-      if (p === '/posts' && m === 'POST') return apiCreatePost(env, request, body);
-      if (p.match(/^\/posts\/\d+$/) && m === 'DELETE') { const id = p.split('/')[2]; return apiDeletePost(env, request, id); }
-      // Admin
-      if (p === '/admin/stats' && m === 'GET') return apiAdminStats(env, request);
-      if (p === '/admin/users' && m === 'GET') return apiAdminUsers(env, request);
-      if (p === '/admin/set-role' && m === 'POST') return apiAdminSetRole(env, request, body);
-      if (p.match(/^\/admin\/users\/\d+$/) && m === 'DELETE') { const id = p.split('/')[3]; return apiAdminDeleteUser(env, request, id); }
-
+      if (p === '/categories' && m === 'GET') return json(env, request);
+      if (p === '/threads' && m === 'GET') return apiThr(env, request);
+      if (p.match(/^\/threads\/\d+$/) && m === 'GET') return apiThrD(env, p.split('/')[2]);
+      if (p === '/threads' && m === 'POST') return apiCThr(env, request, body);
+      if (p.match(/^\/threads\/\d+$/) && m === 'DELETE') return apiDTh(env, request, p.split('/')[2]);
+      if (p === '/posts' && m === 'POST') return apiCPo(env, request, body);
+      if (p.match(/^\/posts\/\d+$/) && m === 'DELETE') return apiDPo(env, request, p.split('/')[2]);
+      if (p === '/admin/stats' && m === 'GET') return apiAS(env, request);
+      if (p === '/admin/users' && m === 'GET') return apiAU(env, request);
+      if (p === '/admin/set-role' && m === 'POST') return apiASR(env, request, body);
+      if (p.match(/^\/admin\/users\/\d+$/) && m === 'DELETE') return apiAD(env, request, p.split('/')[3]);
       return json({ error: 'Not Found' }, 404);
     }
 
-    // 前端页面
-    try {
-      const user = await getCurrentUser(env, request);
-      const html = renderFrontend(user);
-      return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-    } catch (e) {
-      // 紧急降级：纯 HTML 无 JS
-      return new Response('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>NW Forum</title></head><body style="font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f5f7fa;color:#6b7280"><p>论坛正在加载，请稍后刷新。如持续出现，请检查 Cloudflare Dashboard 中的 D1 绑定。</p></body></html>', {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
-    }
+    try { return new Response(htmlPage(await getU(env, request)), { headers: { 'Content-Type': 'text/html; charset=utf-8' } }); }
+    catch (e) { return new Response('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>NW Forum</title></head><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:sans-serif;color:#6b7280"><p>加载失败，请刷新。如持续出现请检查 D1 绑定。</p></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } }); }
   }
 };
